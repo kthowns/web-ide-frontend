@@ -1,8 +1,9 @@
-// src/components/IDELayout.jsx
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿// src/components/IDELayout.jsx
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import { getAccessToken } from "../auth/auth";
 import { createChatClient, sendChat } from "../ws/chatStomp";
+import { createCompileSocket, wsInput, wsStart, wsStop } from "../api/compileWs";
 
 // =========================
 // Config
@@ -56,17 +57,20 @@ function findNodeById(nodes, id) {
   return null;
 }
 
-function isAxiosNotFound(e) {
-  return !!e?.response && e.response.status === 404;
-}
 
-// 서버 트리 응답 normalize
+function extToLang(filename) {
+  const name = (filename || "").toLowerCase();
+  if (name.endsWith(".py")) return "python";
+  if (name.endsWith(".java")) return "java";
+  return null;
+}
+// ?쒕쾭 ?몃━ ?묐떟 normalize
 function normalizeTree(list) {
   if (!Array.isArray(list)) return [];
   return list;
 }
 
-// 로컬 임시 저장 키
+// 濡쒖뺄 ?꾩떆 ?????
 function contentKey(projectId, fileId) {
   return `ide:content:p${projectId}:f${fileId}`;
 }
@@ -104,12 +108,12 @@ export default function IDELayout() {
   // Terminal logs
   const [terminalLines, setTerminalLines] = useState(() => [
     "Web IDE Terminal",
-    "Run 버튼으로 Java/Python 실행 (/ws/compile)",
+    "Run 踰꾪듉?쇰줈 Java/Python ?ㅽ뻾 (/ws/compile)",
   ]);
 
   // Chat
   const [chatMessages, setChatMessages] = useState(() => [
-    { who: "system", content: "TEAM CHAT (실시간)" },
+    { who: "system", content: "TEAM CHAT (?ㅼ떆媛?" },
   ]);
   const chatClientRef = useRef(null);
 
@@ -117,9 +121,23 @@ export default function IDELayout() {
   const [treeLoading, setTreeLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  const pushTerminal = (line) => {
-    setTerminalLines((prev) => [...prev, line]);
-  };
+  const [running, setRunning] = useState(false);
+  const [startPending, setStartPending] = useState(false);
+  const runningRef = useRef(false);
+  const startPendingRef = useRef(false);
+  const wsRef = useRef(null);
+  const wsOpenedRef = useRef(false);
+  const stopRequestedRef = useRef(false);
+  const pendingPayloadRef = useRef(null);
+
+  
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
+
+  useEffect(() => {
+    startPendingRef.current = startPending;
+  }, [startPending]);
 
   // =========================
   // Tree API
@@ -146,7 +164,7 @@ export default function IDELayout() {
       });
     } catch (e) {
       console.error(e);
-      pushTerminal("❌ 파일 트리 로딩 실패 (Network/Console 확인)");
+      pushTerminal("???뚯씪 ?몃━ 濡쒕뵫 ?ㅽ뙣 (Network/Console ?뺤씤)");
     } finally {
       setTreeLoading(false);
     }
@@ -160,7 +178,7 @@ export default function IDELayout() {
   const loadFileContent = async (fileId) => {
     if (!projectId || !fileId) return;
 
-    // 1) 로컬 임시 저장 먼저 적용(데모 안정)
+    // 1) 濡쒖뺄 ?꾩떆 ???癒쇱? ?곸슜(?곕え ?덉젙)
     const cached = localStorage.getItem(contentKey(projectId, fileId));
     if (cached != null) {
       setEditorText(cached);
@@ -170,7 +188,7 @@ export default function IDELayout() {
       setDirty(false);
     }
 
-    // 2) 서버에서 최신 내용 로드(실패해도 로컬 유지)
+    // 2) ?쒕쾭?먯꽌 理쒖떊 ?댁슜 濡쒕뱶(?ㅽ뙣?대룄 濡쒖뺄 ?좎?)
     try {
       const r = await api().get(`/api/file-contents/file/${fileId}`);
       const content = r?.data?.content ?? "";
@@ -178,15 +196,15 @@ export default function IDELayout() {
       localStorage.setItem(contentKey(projectId, fileId), content);
       setDirty(false);
     } catch (e) {
-      // Swagger에 있으니 원칙적으로 404면 이상: fileId가 잘못되었거나 서버쪽 데이터 없거나 라우팅 문제
+      // Swagger???덉쑝???먯튃?곸쑝濡?404硫??댁긽: fileId媛 ?섎せ?섏뿀嫄곕굹 ?쒕쾭履??곗씠???녾굅???쇱슦??臾몄젣
       if (isAxiosNotFound(e)) {
         pushTerminal(
-          "⚠️ 서버에 파일 내용이 없습니다(404) → 로컬 임시 내용으로 진행"
+          "?좑툘 ?쒕쾭???뚯씪 ?댁슜???놁뒿?덈떎(404) ??濡쒖뺄 ?꾩떆 ?댁슜?쇰줈 吏꾪뻾"
         );
         return;
       }
       console.error(e);
-      pushTerminal("⚠️ 파일 내용 로드 실패 → 로컬 임시 내용으로 진행");
+      pushTerminal("?좑툘 ?뚯씪 ?댁슜 濡쒕뱶 ?ㅽ뙣 ??濡쒖뺄 ?꾩떆 ?댁슜?쇰줈 吏꾪뻾");
     }
   };
 
@@ -196,31 +214,31 @@ export default function IDELayout() {
 
     setSaving(true);
     try {
-      // 1) 로컬 저장 먼저(데모 안정)
+      // 1) 濡쒖뺄 ???癒쇱?(?곕え ?덉젙)
       localStorage.setItem(contentKey(projectId, fileId), editorText);
 
-      // 2) 서버 저장 (Swagger: POST /api/file-contents)
+      // 2) ?쒕쾭 ???(Swagger: POST /api/file-contents)
       await api().post(`/api/file-contents`, {
         fileId,
         content: editorText,
       });
 
-      pushTerminal("✅ 저장 완료(서버)");
+      pushTerminal("??????꾨즺(?쒕쾭)");
       setDirty(false);
     } catch (e) {
       console.error(e);
-      // 서버 저장 실패해도 데모 안깨지게: 로컬은 이미 저장됨
+      // ?쒕쾭 ????ㅽ뙣?대룄 ?곕え ?덇묠吏寃? 濡쒖뺄? ?대? ??λ맖
       pushTerminal(
-        "✅ 저장 완료(로컬 임시) — 서버 저장 실패(Network/Console 확인)"
+        "??????꾨즺(濡쒖뺄 ?꾩떆) ???쒕쾭 ????ㅽ뙣(Network/Console ?뺤씤)"
       );
-      setDirty(false); // 데모 목적이면 false가 편함. (원하면 true로 유지 가능)
+      setDirty(false); // ?곕え 紐⑹쟻?대㈃ false媛 ?명븿. (?먰븯硫?true濡??좎? 媛??
     } finally {
       setSaving(false);
     }
   };
 
   // =========================
-  // Create/Rename/Delete (Swagger 기준으로 정리)
+  // Create/Rename/Delete (Swagger 湲곗??쇰줈 ?뺣━)
   // =========================
   const getParentIdForCreate = () => {
     const n = selectedNode;
@@ -231,7 +249,7 @@ export default function IDELayout() {
 
   const handleNewFolder = async () => {
     if (!projectId) return;
-    const name = prompt("새 폴더 이름");
+    const name = prompt("???대뜑 ?대쫫");
     if (name == null) return;
     const trimmed = name.trim();
     if (!trimmed) return;
@@ -245,18 +263,18 @@ export default function IDELayout() {
         type: "FOLDER",
       });
 
-      pushTerminal(`✅ 폴더 생성: ${trimmed}`);
+      pushTerminal(`???대뜑 ?앹꽦: ${trimmed}`);
       await fetchFileTree();
     } catch (e) {
       console.error(e);
-      const msg = e?.response?.data?.message || "폴더 생성 실패";
-      pushTerminal(`❌ ${msg} (Network/Console 확인)`);
+      const msg = e?.response?.data?.message || "?대뜑 ?앹꽦 ?ㅽ뙣";
+      pushTerminal(`??${msg} (Network/Console ?뺤씤)`);
     }
   };
 
   const handleNewFile = async () => {
     if (!projectId) return;
-    const name = prompt("새 파일 이름 (예: Main.py)");
+    const name = prompt("???뚯씪 ?대쫫 (?? Main.py)");
     if (name == null) return;
     const trimmed = name.trim();
     if (!trimmed) return;
@@ -270,7 +288,7 @@ export default function IDELayout() {
         type: "FILE",
       });
 
-      pushTerminal(`✅ 파일 생성: ${trimmed}`);
+      pushTerminal(`???뚯씪 ?앹꽦: ${trimmed}`);
       await fetchFileTree();
 
       const createdId = res?.data?.id;
@@ -278,46 +296,46 @@ export default function IDELayout() {
         setSelectedId(createdId);
         setOpenFileId(createdId);
 
-        // 새 파일은 서버에 content가 없을 수 있으니 로컬 캐시 기본값 세팅
+        // ???뚯씪? ?쒕쾭??content媛 ?놁쓣 ???덉쑝??濡쒖뺄 罹먯떆 湲곕낯媛??명똿
         localStorage.setItem(contentKey(projectId, createdId), "");
         await loadFileContent(createdId);
       }
     } catch (e) {
       console.error(e);
-      const msg = e?.response?.data?.message || "파일 생성 실패";
-      pushTerminal(`❌ ${msg} (Network/Console 확인)`);
+      const msg = e?.response?.data?.message || "?뚯씪 ?앹꽦 ?ㅽ뙣";
+      pushTerminal(`??${msg} (Network/Console ?뺤씤)`);
     }
   };
 
   const handleRename = async () => {
     if (!selectedNode) return;
-    const newName = prompt("이름 변경", selectedNode.name);
+    const newName = prompt("Rename file or folder", selectedNode.name);
     if (newName == null) return;
     const trimmed = newName.trim();
     if (!trimmed) return;
 
     try {
-      // ✅ Swagger: PUT /api/files/{fileId}/name
+      // ??Swagger: PUT /api/files/{fileId}/name
       await api().put(`/api/files/${selectedNode.id}/name`, { name: trimmed });
-      pushTerminal(`✅ 이름 변경: ${trimmed}`);
+      pushTerminal(`???대쫫 蹂寃? ${trimmed}`);
       await fetchFileTree();
     } catch (e) {
       console.error(e);
-      pushTerminal("❌ 이름 변경 실패 (Network/Console 확인)");
+      pushTerminal("???대쫫 蹂寃??ㅽ뙣 (Network/Console ?뺤씤)");
     }
   };
 
   const handleDelete = async () => {
     if (!selectedNode) return;
-    const ok = confirm(`삭제할까요?\n- ${selectedNode.name}`);
+    const ok = confirm(`??젣?좉퉴??\n- ${selectedNode.name}`);
     if (!ok) return;
 
     try {
-      // ✅ Swagger: DELETE /api/files/{fileId}
+      // ??Swagger: DELETE /api/files/{fileId}
       await api().delete(`/api/files/${selectedNode.id}`);
-      pushTerminal(`✅ 삭제 완료: ${selectedNode.name}`);
+      pushTerminal(`????젣 ?꾨즺: ${selectedNode.name}`);
 
-      // 열린 파일을 지웠으면 에디터 비우기
+      // ?대┛ ?뚯씪??吏?좎쑝硫??먮뵒??鍮꾩슦湲?
       if (openFileId === selectedNode.id) {
         setOpenFileId(null);
         setEditorText("");
@@ -328,7 +346,7 @@ export default function IDELayout() {
       await fetchFileTree();
     } catch (e) {
       console.error(e);
-      pushTerminal("❌ 삭제 실패 (Network/Console 확인)");
+      pushTerminal("????젣 ?ㅽ뙣 (Network/Console ?뺤씤)");
     }
   };
 
@@ -344,7 +362,7 @@ export default function IDELayout() {
       onConnected: () => {
         setChatMessages((prev) => [
           ...prev,
-          { who: "system", content: "채팅 서버에 연결되었습니다." },
+          { who: "system", content: "梨꾪똿 ?쒕쾭???곌껐?섏뿀?듬땲??" },
         ]);
       },
       onMessage: (body) => {
@@ -388,7 +406,7 @@ export default function IDELayout() {
   useEffect(() => {
     if (!projectId) {
       pushTerminal(
-        "⚠️ 활성 프로젝트가 없습니다. /projects에서 프로젝트 선택 필요"
+        "?좑툘 ?쒖꽦 ?꾨줈?앺듃媛 ?놁뒿?덈떎. /projects?먯꽌 ?꾨줈?앺듃 ?좏깮 ?꾩슂"
       );
       return;
     }
@@ -405,7 +423,7 @@ export default function IDELayout() {
     if (node.type === "FILE") {
       if (dirty) {
         const ok = confirm(
-          "저장되지 않은 변경이 있습니다. 저장하고 이동할까요?"
+          "You have unsaved changes. Save before opening?"
         );
         if (ok) await saveFileContent();
       }
@@ -413,6 +431,184 @@ export default function IDELayout() {
       await loadFileContent(node.id);
     }
   };
+
+  // =========================
+  // Compile WS
+  // =========================
+  const ensureCompileSocket = useCallback(() => {
+    if (
+      wsRef.current &&
+      (wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    wsOpenedRef.current = false;
+
+    const ws = createCompileSocket({
+      onOpen: () => {
+        wsOpenedRef.current = true;
+
+        if (pendingPayloadRef.current) {
+          const payload = pendingPayloadRef.current;
+          pendingPayloadRef.current = null;
+          setStartPending(false);
+          setRunning(true);
+          pushTerminal(`RUN (${payload.language})`);
+          wsStart(ws, payload);
+        }
+      },
+      onClose: () => {
+        wsRef.current = null;
+        wsOpenedRef.current = false;
+
+        if (stopRequestedRef.current) {
+          stopRequestedRef.current = false;
+          setRunning(false);
+          setStartPending(false);
+          return;
+        }
+
+        if (runningRef.current || startPendingRef.current) {
+          pushTerminal("실행 중단됨");
+        }
+
+        setRunning(false);
+        setStartPending(false);
+      },
+      onError: () => {
+        if (wsOpenedRef.current) {
+          if (runningRef.current || startPendingRef.current) {
+            pushTerminal("실행 중단됨");
+          }
+        } else {
+          pushTerminal("WebSocket 연결 실패");
+        }
+
+        setRunning(false);
+        setStartPending(false);
+        wsRef.current = null;
+        wsOpenedRef.current = false;
+        stopRequestedRef.current = false;
+        pendingPayloadRef.current = null;
+      },
+      onMessage: (msg) => {
+        if (!msg || typeof msg !== "object") return;
+
+        if (msg.type === "output") {
+          const prefix = msg.stream === "stderr" ? "[stderr] " : "";
+          pushTerminal(prefix + (msg.data ?? ""));
+          return;
+        }
+
+        if (msg.type === "result") {
+          const stdout = msg.stdout ?? msg.SystemOut ?? "";
+          if (stdout) pushTerminal(stdout);
+          if (msg.stderr) pushTerminal("[stderr] " + msg.stderr);
+          pushTerminal(
+            `result: ${msg.result ?? ""} (exitCode=${msg.exitCode ?? ""}, ${msg.performance ?? ""}ms)`
+          );
+          setRunning(false);
+          setStartPending(false);
+          return;
+        }
+
+        if (msg.type === "error") {
+          pushTerminal("Error: " + (msg.message ?? ""));
+          setRunning(false);
+          setStartPending(false);
+        }
+      },
+    });
+
+    wsRef.current = ws;
+  }, [pushTerminal]);
+
+  useEffect(() => {
+    return () => {
+      try {
+        wsRef.current?.close();
+      } catch {}
+      wsRef.current = null;
+    };
+  }, []);
+
+  const activeFileName = selectedNode?.type === "FILE"
+    ? selectedNode.name
+    : openFileNode?.name || "";
+  const activeLanguage = extToLang(activeFileName);
+
+  const isFileSelected = selectedNode?.type === "FILE" && !!openFileId;
+  const isRunnableLanguage = !!activeLanguage;
+  const isRunDisabled =
+    !isFileSelected || !isRunnableLanguage || running || startPending;
+  const isStopDisabled = !running;
+  const isSaveDisabled = !isFileSelected || running || startPending || saving;
+
+    let runDisabledReason = "";
+  if (!isFileSelected) {
+    runDisabledReason =
+      selectedNode?.type === "FOLDER"
+        ? "Folders cannot be executed."
+        : "Select a file.";
+  } else if (!isRunnableLanguage) {
+    runDisabledReason = "Only .py/.java files can run.";
+  } else if (running || startPending) {
+    runDisabledReason = "Running...";
+  }
+
+  const handleRun = useCallback(() => {
+    if (isRunDisabled) return;
+
+    const payload = {
+      code: editorText,
+      language: activeLanguage,
+      params: [],
+    };
+
+    ensureCompileSocket();
+    const ws = wsRef.current;
+
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      pendingPayloadRef.current = payload;
+      setStartPending(true);
+      pushTerminal("[ws] connecting...");
+      return;
+    }
+
+    setRunning(true);
+    pushTerminal(`RUN (${payload.language})`);
+    wsStart(ws, payload);
+  }, [
+    activeLanguage,
+    editorText,
+    ensureCompileSocket,
+    isRunDisabled,
+    pushTerminal,
+  ]);
+
+  const handleStop = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    stopRequestedRef.current = true;
+    pendingPayloadRef.current = null;
+    setStartPending(false);
+    setRunning(false);
+    pushTerminal("실행 중단됨");
+    wsStop(ws);
+  }, [pushTerminal]);
+
+  const handleSendInput = useCallback(
+    (text) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      wsInput(ws, text);
+      pushTerminal("> " + text);
+    },
+    [pushTerminal]
+  );
 
   // =========================
   // Render helpers
@@ -439,47 +635,31 @@ export default function IDELayout() {
         </div>
 
         <div className="header-center">
-          <select
-            style={{
-              height: 34,
-              background: "#2d2d2d",
-              color: "#e5e5e5",
-              border: "1px solid rgba(255,255,255,0.12)",
-              borderRadius: 6,
-              padding: "0 10px",
-            }}
-            defaultValue="python"
-          >
-            <option value="python">python</option>
-            <option value="java">java</option>
-          </select>
-
-          <button
-            className="icon-btn"
-            onClick={() => pushTerminal("Run (demo)")}
-          >
+          <button className="icon-btn" onClick={handleRun} disabled={isRunDisabled}>
             Run
           </button>
-          <button
-            className="icon-btn"
-            onClick={() => pushTerminal("Stop (demo)")}
-          >
+          <button className="icon-btn" onClick={handleStop} disabled={isStopDisabled}>
             Stop
           </button>
           <button
             className="icon-btn"
             onClick={saveFileContent}
-            disabled={!openFileId || saving}
-            title={!openFileId ? "파일을 선택하세요" : ""}
+            disabled={isSaveDisabled}
+            title={!isFileSelected ? "Select a file to save." : ""}
           >
             {saving ? "Saving..." : dirty ? "Save *" : "Save"}
           </button>
+          {runDisabledReason && (
+            <span style={{ fontSize: 12, opacity: 0.7 }}>
+              {runDisabledReason}
+            </span>
+          )}
         </div>
 
         <div className="header-right">
           <div className="profile">
-            <div className="profile-avatar">👤</div>
-            <div className="profile-name">{project?.name ?? "프로젝트"}</div>
+            <div className="profile-avatar">?뫀</div>
+            <div className="profile-name">{project?.name ?? "?꾨줈?앺듃"}</div>
           </div>
         </div>
       </div>
@@ -502,7 +682,7 @@ export default function IDELayout() {
                 disabled={!selectedNode}
                 style={{ opacity: selectedNode ? 1 : 0.5 }}
               >
-                ✏️ Rename
+                ?륅툘 Rename
               </button>
               <button
                 className="file-action-btn"
@@ -510,7 +690,7 @@ export default function IDELayout() {
                 disabled={!selectedNode}
                 style={{ opacity: selectedNode ? 1 : 0.5 }}
               >
-                🗑️ Delete
+                ?뿊截?Delete
               </button>
             </div>
 
@@ -545,7 +725,7 @@ export default function IDELayout() {
             <div className="editor-content">
               {!openFileId ? (
                 <div style={{ opacity: 0.7, padding: 10 }}>
-                  파일을 선택해 코드를 입력해보세요...
+                  ?뚯씪???좏깮??肄붾뱶瑜??낅젰?대낫?몄슂...
                 </div>
               ) : (
                 <textarea
@@ -554,7 +734,7 @@ export default function IDELayout() {
                   onChange={(e) => {
                     setEditorText(e.target.value);
                     setDirty(true);
-                    // 데모 안정: 입력할 때마다 로컬 임시 저장
+                    // ?곕え ?덉젙: ?낅젰???뚮쭏??濡쒖뺄 ?꾩떆 ???
                     localStorage.setItem(
                       contentKey(projectId, openFileId),
                       e.target.value
@@ -577,7 +757,7 @@ export default function IDELayout() {
         <TerminalPanel
           lines={terminalLines}
           onClear={() => setTerminalLines(["Web IDE Terminal"])}
-          onSendInput={(text) => pushTerminal(`> ${text}`)}
+          onSendInput={handleSendInput}
         />
       </div>
     </div>
@@ -627,7 +807,7 @@ function TreeNode({ node, depth, selectedId, onClickNode }) {
           paddingLeft: 8 + depth * 14,
         }}
       >
-        <span style={{ opacity: 0.85 }}>{isFolder ? "📁" : "📄"}</span>
+        <span style={{ opacity: 0.85 }}>{isFolder ? "?뱚" : "?뱞"}</span>
         <span>{node.name}</span>
       </button>
 
@@ -685,7 +865,7 @@ function ChatPanel({ messages, onSend }) {
           className="chat-input"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="메시지를 입력하세요... (Enter 전송 / Shift+Enter 줄바꿈)"
+          placeholder="硫붿떆吏瑜??낅젰?섏꽭??.. (Enter ?꾩넚 / Shift+Enter 以꾨컮轅?"
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
@@ -731,7 +911,7 @@ function TerminalPanel({ lines, onClear, onSendInput }) {
           className="terminal-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="stdin 입력 후 Enter (필요할 때만)"
+          placeholder="stdin ?낅젰 ??Enter (?꾩슂???뚮쭔)"
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               onSendInput?.(input);
@@ -746,3 +926,21 @@ function TerminalPanel({ lines, onClear, onSendInput }) {
     </div>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -7,9 +7,10 @@ export default function HeaderBar({
   onStop,
   onSave,
 
-  running = false,
-  language = "python",
-  onChangeLanguage,
+  isRunDisabled = false,
+  isStopDisabled = true,
+  isSaveDisabled = false,
+  runDisabledReason = "",
 
   onLogout,
   user,
@@ -38,26 +39,22 @@ export default function HeaderBar({
 
         <div style={{ width: 10 }} />
 
-        <select
-          value={language}
-          onChange={(e) => onChangeLanguage?.(e.target.value)}
-          style={{ padding: "6px 8px" }}
-        >
-          <option value="python">python</option>
-          <option value="java">java</option>
-        </select>
-
-        <button type="button" onClick={onRun} disabled={running}>
-          {running ? "Running..." : "Run"}
+        <button type="button" onClick={onRun} disabled={isRunDisabled}>
+          Run
         </button>
 
-        <button type="button" onClick={onStop} disabled={!running}>
+        <button type="button" onClick={onStop} disabled={isStopDisabled}>
           Stop
         </button>
 
-        <button type="button" onClick={onSave} disabled={running}>
+        <button type="button" onClick={onSave} disabled={isSaveDisabled}>
           Save
         </button>
+        {runDisabledReason && (
+          <span style={{ fontSize: 12, opacity: 0.7 }}>
+            {runDisabledReason}
+          </span>
+        )}
       </div>
 
       <div
