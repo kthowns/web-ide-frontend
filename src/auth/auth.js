@@ -1,3 +1,4 @@
+//auth,js
 const USER_KEY = "user";
 const TOKEN_KEY = "accessToken";
 const ACTIVE_PROJECT_KEY = "activeProject";

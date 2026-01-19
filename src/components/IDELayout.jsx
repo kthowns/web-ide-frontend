@@ -1,621 +1,748 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+// src/components/IDELayout.jsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import axios from "axios";
+import { getAccessToken } from "../auth/auth";
+import { createChatClient, sendChat } from "../ws/chatStomp";
 
-import FileExplorer from "../components/FileExplorer";
-import EditorArea from "../components/EditorArea";
-import ChatPanel from "../components/ChatPanel";
-import TerminalPanel from "../components/TerminalPanel";
-import HeaderBar from "../components/HeaderBar";
+// =========================
+// Config
+// =========================
+const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "https://t2.mobidic.shop";
 
-import { getActiveProject, logout } from "../auth/auth";
-import { fileApi } from "../api/fileApi";
-import { fileContentApi } from "../api/fileContentApi";
-import {
-  createCompileSocket,
-  wsInput,
-  wsStart,
-  wsStop,
-} from "../api/compileWs";
-
-// ---------------- utils ----------------
-function normalizePath(path) {
-  if (!path) return "";
-  return path
-    .replaceAll("\\", "/")
-    .replace(/\/+/g, "/")
-    .replace(/^\/|\/$/g, "");
-}
-
-function extToLang(filename) {
-  const n = (filename || "").toLowerCase();
-  if (n.endsWith(".py")) return "python";
-  if (n.endsWith(".java")) return "java";
-  return null;
-}
-
-/**
- * 서버 tree node (children 있을 수도) 를 UI 타입으로 변환
- * server type: "FOLDER"|"FILE"  -> UI: "folder"|"file"
- */
-function convertServerTreeToUi(node) {
-  if (!node || typeof node !== "object") return null;
-
-  const isFolder = node.type === "FOLDER";
-  const ui = {
-    id: node.id,
-    name: node.name,
-    type: isFolder ? "folder" : "file",
-    projectId: node.projectId,
-    parentId: node.parentId,
-    children: isFolder ? [] : undefined,
-    _raw: node,
-  };
-
-  const children = Array.isArray(node.children) ? node.children : [];
-  if (isFolder) {
-    ui.children = children.map(convertServerTreeToUi).filter(Boolean);
-  }
-  return ui;
-}
-
-/**
- * 서버 응답이 flat(list)인지 tree인지 모를 때 "무조건 UI 트리(root)"로 정규화
- */
-function normalizeToUiRoot(serverData) {
-  // 1) 이미 트리 배열로 오는 경우
-  if (
-    Array.isArray(serverData) &&
-    serverData.length > 0 &&
-    serverData[0]?.children
-  ) {
-    return {
-      type: "folder",
-      name: "root",
-      children: serverData.map(convertServerTreeToUi).filter(Boolean),
-    };
-  }
-
-  // 2) 단일 트리 노드로 오는 경우
-  if (
-    serverData &&
-    typeof serverData === "object" &&
-    Array.isArray(serverData.children)
-  ) {
-    const uiNode = convertServerTreeToUi(serverData);
-    if (uiNode?.name === "root") return uiNode;
-    return { type: "folder", name: "root", children: [uiNode].filter(Boolean) };
-  }
-
-  // 3) flat list로 오는 경우
-  if (Array.isArray(serverData)) {
-    const flat = serverData;
-    const root = { type: "folder", name: "root", children: [] };
-    const map = new Map();
-
-    flat.forEach((item) => {
-      const isFolder = item.type === "FOLDER";
-      map.set(item.id, {
-        id: item.id,
-        name: item.name,
-        type: isFolder ? "folder" : "file",
-        projectId: item.projectId,
-        parentId: item.parentId,
-        children: isFolder ? [] : undefined,
-        _raw: item,
-      });
-    });
-
-    flat.forEach((item) => {
-      const node = map.get(item.id);
-      const parentId = item.parentId;
-
-      if (parentId == null) {
-        root.children.push(node);
-        return;
-      }
-      const parent = map.get(parentId);
-      if (parent && parent.type === "folder") parent.children.push(node);
-      else root.children.push(node);
-    });
-
-    // 폴더 먼저 정렬
-    const sortRec = (folder) => {
-      folder.children?.sort((a, b) => {
-        if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
-        return (a.name ?? "").localeCompare(b.name ?? "");
-      });
-      folder.children?.forEach((c) => c.type === "folder" && sortRec(c));
-    };
-    sortRec(root);
-
-    return root;
-  }
-
-  return { type: "folder", name: "root", children: [] };
-}
-
-/**
- * UI 트리에서 id로 노드 찾기
- */
-function findNodeById(root, id) {
-  if (!root || !id) return null;
-  const stack = [root];
-  while (stack.length) {
-    const cur = stack.pop();
-    if (cur?.id === id) return cur;
-    const children = Array.isArray(cur?.children) ? cur.children : [];
-    for (const c of children) stack.push(c);
-  }
-  return null;
-}
-
-// ---------------- component ----------------
-export default function IDELayout() {
-  const navigate = useNavigate();
-  const activeProject = getActiveProject();
-  const projectId = activeProject?.id ?? null;
-
-  const [fileTree, setFileTree] = useState({
-    type: "folder",
-    name: "root",
-    children: [],
+function api() {
+  const token = getAccessToken();
+  const instance = axios.create({
+    baseURL: BASE_URL,
+    withCredentials: true,
   });
+  instance.interceptors.request.use((config) => {
+    if (token) config.headers.Authorization = `Bearer ${token}`;
+    return config;
+  });
+  return instance;
+}
 
-  const [selectedNodeId, setSelectedNodeId] = useState(null);
-  const [selectedPath, setSelectedPath] = useState("");
-  const [openFileId, setOpenFileId] = useState(null);
-  const [openFileName, setOpenFileName] = useState("");
-  const [openFilePath, setOpenFilePath] = useState("");
+// =========================
+// Utils
+// =========================
+function safeJsonParse(s, fallback) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return fallback;
+  }
+}
 
-  const [editorValue, setEditorValue] = useState("");
-  const [dirty, setDirty] = useState(false);
+function getActiveProjectFromStorage() {
+  const raw =
+    localStorage.getItem("activeProject") ||
+    localStorage.getItem("ACTIVE_PROJECT") ||
+    localStorage.getItem("project") ||
+    "";
+  const obj = safeJsonParse(raw, null);
+  if (obj?.id) return obj;
+  if (obj?._raw?.id) return obj._raw;
+  return null;
+}
 
+function findNodeById(nodes, id) {
+  for (const n of nodes) {
+    if (n.id === id) return n;
+    if (n.children?.length) {
+      const found = findNodeById(n.children, id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function isAxiosNotFound(e) {
+  return !!e?.response && e.response.status === 404;
+}
+
+// 서버 트리 응답 normalize
+function normalizeTree(list) {
+  if (!Array.isArray(list)) return [];
+  return list;
+}
+
+// 로컬 임시 저장 키
+function contentKey(projectId, fileId) {
+  return `ide:content:p${projectId}:f${fileId}`;
+}
+
+// =========================
+// Component
+// =========================
+export default function IDELayout() {
+  const project = useMemo(() => getActiveProjectFromStorage(), []);
+  const projectId = project?.id ?? null;
+
+  // Panels
   const [showLeft, setShowLeft] = useState(true);
   const [showRight, setShowRight] = useState(true);
   const [showTerminal, setShowTerminal] = useState(true);
 
-  // ---------- terminal / ws ----------
-  const [terminalLines, setTerminalLines] = useState([
+  // Tree & selection
+  const [tree, setTree] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const selectedNode = useMemo(
+    () => (selectedId ? findNodeById(tree, selectedId) : null),
+    [tree, selectedId]
+  );
+
+  // Open file & content
+  const [openFileId, setOpenFileId] = useState(null);
+  const openFileNode = useMemo(
+    () => (openFileId ? findNodeById(tree, openFileId) : null),
+    [tree, openFileId]
+  );
+
+  const [editorText, setEditorText] = useState("");
+  const [dirty, setDirty] = useState(false);
+
+  // Terminal logs
+  const [terminalLines, setTerminalLines] = useState(() => [
     "Web IDE Terminal",
     "Run 버튼으로 Java/Python 실행 (/ws/compile)",
   ]);
-  const [running, setRunning] = useState(false);
-  const [language, setLanguage] = useState("python");
-  const wsRef = useRef(null);
-  const pendingStartRef = useRef(null);
 
-  const appendTerminal = useCallback((text) => {
-    setTerminalLines((prev) => [...prev, text]);
-  }, []);
+  // Chat
+  const [chatMessages, setChatMessages] = useState(() => [
+    { who: "system", content: "TEAM CHAT (실시간)" },
+  ]);
+  const chatClientRef = useRef(null);
 
-  const clearTerminal = useCallback(() => {
-    setTerminalLines([]);
-  }, []);
+  // Loading flags
+  const [treeLoading, setTreeLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  const connectWsIfNeeded = useCallback(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+  const pushTerminal = (line) => {
+    setTerminalLines((prev) => [...prev, line]);
+  };
 
-    // 이미 연결중이면 그대로 둠
-    if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING)
-      return;
-
-    const ws = createCompileSocket({
-      onOpen: () => {
-        appendTerminal("[ws] connected");
-
-        // 연결 전에 Run 눌렀으면 여기서 start
-        if (pendingStartRef.current) {
-          const payload = pendingStartRef.current;
-          pendingStartRef.current = null;
-
-          setRunning(true);
-          appendTerminal(`\n▶️ RUN (${payload.language})`);
-          wsStart(ws, payload);
-        }
-      },
-      onClose: (e) => {
-        appendTerminal(`[ws] closed (code=${e?.code ?? "?"})`);
-        wsRef.current = null;
-        setRunning(false);
-      },
-      onError: () => {
-        appendTerminal("[ws] error");
-        setRunning(false);
-      },
-      onMessage: (msg) => {
-        if (!msg || typeof msg !== "object") return;
-
-        if (msg.type === "output") {
-          const prefix = msg.stream === "stderr" ? "[stderr] " : "";
-          appendTerminal(prefix + (msg.data ?? ""));
-          return;
-        }
-
-        if (msg.type === "result") {
-          appendTerminal("");
-          appendTerminal(
-            `✅ result: ${msg.result ?? ""} (exitCode=${msg.exitCode ?? ""}, ${msg.performance ?? ""}ms)`
-          );
-          if (msg.stderr) appendTerminal("[stderr]\n" + msg.stderr);
-          setRunning(false);
-          return;
-        }
-
-        if (msg.type === "error") {
-          appendTerminal("❌ error: " + (msg.message ?? "unknown"));
-          setRunning(false);
-        }
-      },
-    });
-
-    wsRef.current = ws;
-  }, [appendTerminal]);
-
-  useEffect(() => {
-    return () => {
-      try {
-        wsRef.current?.close();
-      } catch {}
-      wsRef.current = null;
-    };
-  }, []);
-
-  // ---------- auth/project guard ----------
-  useEffect(() => {
-    if (!activeProject) navigate("/projects", { replace: true });
-  }, [activeProject, navigate]);
-
-  // ---------- tree ----------
-  const refreshTree = useCallback(async () => {
+  // =========================
+  // Tree API
+  // =========================
+  const fetchFileTree = async () => {
     if (!projectId) return;
-    const data = await fileApi.getTree(projectId);
-    const uiRoot = normalizeToUiRoot(data);
-    setFileTree(uiRoot);
-  }, [projectId]);
 
-  useEffect(() => {
-    if (!projectId) return;
-    refreshTree().catch(console.error);
-  }, [projectId, refreshTree]);
+    setTreeLoading(true);
+    try {
+      const res = await api().get(`/api/files/project/${projectId}/tree`);
+      const normalized = normalizeTree(res.data);
+      setTree(normalized);
 
-  // ---------- select ----------
-  const handleSelect = useCallback(
-    async (path, type) => {
-      const p = normalizePath(path);
-      setSelectedPath(p);
+      setSelectedId((prev) => {
+        if (!prev) return null;
+        const still = findNodeById(normalized, prev);
+        return still ? prev : null;
+      });
 
-      // 기존 방식 유지: 선택 path 기반 id 계산
-      // (FileExplorer가 id를 안 넘기는 버전이라도 동작)
-      const dfs = (node, curPath) => {
-        const nextPath =
-          node.name === "root"
-            ? ""
-            : curPath
-              ? `${curPath}/${node.name}`
-              : node.name;
+      setOpenFileId((prev) => {
+        if (!prev) return null;
+        const still = findNodeById(normalized, prev);
+        return still ? prev : null;
+      });
+    } catch (e) {
+      console.error(e);
+      pushTerminal("❌ 파일 트리 로딩 실패 (Network/Console 확인)");
+    } finally {
+      setTreeLoading(false);
+    }
+  };
 
-        if (normalizePath(nextPath) === normalizePath(p) && node.id) {
-          return node.id;
-        }
-        if (node.type === "folder" && Array.isArray(node.children)) {
-          for (const c of node.children) {
-            const found = dfs(c, nextPath);
-            if (found) return found;
-          }
-        }
-        return null;
-      };
+  // =========================
+  // Content API (Swagger fixed)
+  //  - GET  /api/file-contents/file/{fileId}
+  //  - POST /api/file-contents  { fileId, content }
+  // =========================
+  const loadFileContent = async (fileId) => {
+    if (!projectId || !fileId) return;
 
-      const id = dfs(fileTree, "");
-      setSelectedNodeId(id);
+    // 1) 로컬 임시 저장 먼저 적용(데모 안정)
+    const cached = localStorage.getItem(contentKey(projectId, fileId));
+    if (cached != null) {
+      setEditorText(cached);
+      setDirty(false);
+    } else {
+      setEditorText("");
+      setDirty(false);
+    }
 
-      if (type === "file" && id) {
-        // 파일 열기
-        setOpenFileId(id);
-        setOpenFilePath(p);
-
-        const node = findNodeById(fileTree, id);
-        const name = node?.name ?? "";
-        setOpenFileName(name);
-
-        const inferred = extToLang(name);
-        if (inferred) setLanguage(inferred);
-
-        try {
-          const latest = await fileContentApi.getLatest(id);
-          setEditorValue(latest?.content ?? "");
-          setDirty(false);
-        } catch (e) {
-          console.error(e);
-          setEditorValue("");
-          setDirty(false);
-          alert("파일 내용 불러오기 실패 (Network/Console 확인)");
-        }
+    // 2) 서버에서 최신 내용 로드(실패해도 로컬 유지)
+    try {
+      const r = await api().get(`/api/file-contents/file/${fileId}`);
+      const content = r?.data?.content ?? "";
+      setEditorText(content);
+      localStorage.setItem(contentKey(projectId, fileId), content);
+      setDirty(false);
+    } catch (e) {
+      // Swagger에 있으니 원칙적으로 404면 이상: fileId가 잘못되었거나 서버쪽 데이터 없거나 라우팅 문제
+      if (isAxiosNotFound(e)) {
+        pushTerminal(
+          "⚠️ 서버에 파일 내용이 없습니다(404) → 로컬 임시 내용으로 진행"
+        );
+        return;
       }
-    },
-    [fileTree]
-  );
+      console.error(e);
+      pushTerminal("⚠️ 파일 내용 로드 실패 → 로컬 임시 내용으로 진행");
+    }
+  };
 
-  // ---------- create folder/file ----------
-  const handleNewFolder = useCallback(async () => {
-    if (!projectId) return alert("프로젝트를 먼저 선택해주세요.");
+  const saveFileContent = async () => {
+    if (!openFileId || !projectId) return;
+    const fileId = openFileId;
 
-    const name = prompt("새 폴더 이름을 입력하세요 (예: components)");
-    if (!name) return;
+    setSaving(true);
+    try {
+      // 1) 로컬 저장 먼저(데모 안정)
+      localStorage.setItem(contentKey(projectId, fileId), editorText);
+
+      // 2) 서버 저장 (Swagger: POST /api/file-contents)
+      await api().post(`/api/file-contents`, {
+        fileId,
+        content: editorText,
+      });
+
+      pushTerminal("✅ 저장 완료(서버)");
+      setDirty(false);
+    } catch (e) {
+      console.error(e);
+      // 서버 저장 실패해도 데모 안깨지게: 로컬은 이미 저장됨
+      pushTerminal(
+        "✅ 저장 완료(로컬 임시) — 서버 저장 실패(Network/Console 확인)"
+      );
+      setDirty(false); // 데모 목적이면 false가 편함. (원하면 true로 유지 가능)
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // =========================
+  // Create/Rename/Delete (Swagger 기준으로 정리)
+  // =========================
+  const getParentIdForCreate = () => {
+    const n = selectedNode;
+    if (!n) return null;
+    if (n.type === "FOLDER") return n.id;
+    return n.parentId ?? null;
+  };
+
+  const handleNewFolder = async () => {
+    if (!projectId) return;
+    const name = prompt("새 폴더 이름");
+    if (name == null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
 
     try {
-      const parentId = selectedNodeId
-        ? findNodeById(fileTree, selectedNodeId)?.type === "folder"
-          ? selectedNodeId
-          : (findNodeById(fileTree, selectedNodeId)?.parentId ?? null)
-        : null;
-
-      await fileApi.create({
+      const parentId = getParentIdForCreate();
+      await api().post(`/api/files`, {
         projectId,
         parentId,
-        name: name.trim(),
+        name: trimmed,
         type: "FOLDER",
       });
 
-      await refreshTree();
+      pushTerminal(`✅ 폴더 생성: ${trimmed}`);
+      await fetchFileTree();
     } catch (e) {
       console.error(e);
-      alert("폴더 생성 실패 (Network/Console 확인)");
+      const msg = e?.response?.data?.message || "폴더 생성 실패";
+      pushTerminal(`❌ ${msg} (Network/Console 확인)`);
     }
-  }, [projectId, selectedNodeId, fileTree, refreshTree]);
+  };
 
-  const handleNewFile = useCallback(async () => {
-    if (!projectId) return alert("프로젝트를 먼저 선택해주세요.");
-
-    const name = prompt("새 파일 이름을 입력하세요 (예: Main.py / Main.java)");
-    if (!name) return;
+  const handleNewFile = async () => {
+    if (!projectId) return;
+    const name = prompt("새 파일 이름 (예: Main.py)");
+    if (name == null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
 
     try {
-      const parentId = selectedNodeId
-        ? findNodeById(fileTree, selectedNodeId)?.type === "folder"
-          ? selectedNodeId
-          : (findNodeById(fileTree, selectedNodeId)?.parentId ?? null)
-        : null;
-
-      await fileApi.create({
+      const parentId = getParentIdForCreate();
+      const res = await api().post(`/api/files`, {
         projectId,
         parentId,
-        name: name.trim(),
+        name: trimmed,
         type: "FILE",
       });
 
-      await refreshTree();
-    } catch (e) {
-      console.error(e);
-      alert("파일 생성 실패 (Network/Console 확인)");
-    }
-  }, [projectId, selectedNodeId, fileTree, refreshTree]);
+      pushTerminal(`✅ 파일 생성: ${trimmed}`);
+      await fetchFileTree();
 
-  const handleDelete = useCallback(async () => {
-    if (!projectId) return alert("프로젝트를 먼저 선택해주세요.");
-    if (!selectedNodeId) return alert("삭제할 파일/폴더를 선택해주세요.");
+      const createdId = res?.data?.id;
+      if (createdId) {
+        setSelectedId(createdId);
+        setOpenFileId(createdId);
 
-    const node = findNodeById(fileTree, selectedNodeId);
-    if (!node?.id) return alert("삭제 실패(선택 노드 id 없음)");
-
-    // eslint-disable-next-line no-restricted-globals
-    if (!confirm(`정말 삭제할까요?\n${node.name}`)) return;
-
-    try {
-      await fileApi.remove(node.id);
-      await refreshTree();
-
-      setSelectedNodeId(null);
-      setSelectedPath("");
-
-      if (openFileId === node.id) {
-        setOpenFileId(null);
-        setOpenFileName("");
-        setOpenFilePath("");
-        setEditorValue("");
-        setDirty(false);
+        // 새 파일은 서버에 content가 없을 수 있으니 로컬 캐시 기본값 세팅
+        localStorage.setItem(contentKey(projectId, createdId), "");
+        await loadFileContent(createdId);
       }
     } catch (e) {
       console.error(e);
-      alert("삭제 실패 (Network/Console 확인)");
+      const msg = e?.response?.data?.message || "파일 생성 실패";
+      pushTerminal(`❌ ${msg} (Network/Console 확인)`);
     }
-  }, [projectId, selectedNodeId, fileTree, refreshTree, openFileId]);
+  };
 
-  // ---------- save ----------
-  const handleSave = useCallback(async () => {
-    if (!openFileId) return alert("저장할 파일을 먼저 선택해주세요.");
+  const handleRename = async () => {
+    if (!selectedNode) return;
+    const newName = prompt("이름 변경", selectedNode.name);
+    if (newName == null) return;
+    const trimmed = newName.trim();
+    if (!trimmed) return;
 
     try {
-      await fileContentApi.save({ fileId: openFileId, content: editorValue });
-      setDirty(false);
-      appendTerminal(`💾 Saved (${openFileName || openFileId})`);
+      // ✅ Swagger: PUT /api/files/{fileId}/name
+      await api().put(`/api/files/${selectedNode.id}/name`, { name: trimmed });
+      pushTerminal(`✅ 이름 변경: ${trimmed}`);
+      await fetchFileTree();
     } catch (e) {
       console.error(e);
-      alert("저장 실패 (Network/Console 확인)");
+      pushTerminal("❌ 이름 변경 실패 (Network/Console 확인)");
     }
-  }, [openFileId, editorValue, appendTerminal, openFileName]);
+  };
 
-  // ---------- run/stop ----------
-  const handleRun = useCallback(() => {
-    if (running) return;
-    if (!openFileId) return alert("실행할 파일을 선택해주세요.");
-    if (!editorValue.trim()) return alert("코드가 비어있습니다.");
+  const handleDelete = async () => {
+    if (!selectedNode) return;
+    const ok = confirm(`삭제할까요?\n- ${selectedNode.name}`);
+    if (!ok) return;
 
-    const lang = language; // dropdown 우선
-    if (lang !== "python" && lang !== "java") {
-      alert("언어를 python 또는 java로 선택해주세요.");
+    try {
+      // ✅ Swagger: DELETE /api/files/{fileId}
+      await api().delete(`/api/files/${selectedNode.id}`);
+      pushTerminal(`✅ 삭제 완료: ${selectedNode.name}`);
+
+      // 열린 파일을 지웠으면 에디터 비우기
+      if (openFileId === selectedNode.id) {
+        setOpenFileId(null);
+        setEditorText("");
+        setDirty(false);
+      }
+      setSelectedId(null);
+
+      await fetchFileTree();
+    } catch (e) {
+      console.error(e);
+      pushTerminal("❌ 삭제 실패 (Network/Console 확인)");
+    }
+  };
+
+  // =========================
+  // Chat (STOMP)
+  // =========================
+  useEffect(() => {
+    if (!projectId) return;
+
+    const roomId = `p_${projectId}`;
+    const client = createChatClient({
+      roomId,
+      onConnected: () => {
+        setChatMessages((prev) => [
+          ...prev,
+          { who: "system", content: "채팅 서버에 연결되었습니다." },
+        ]);
+      },
+      onMessage: (body) => {
+        if (!body) return;
+        setChatMessages((prev) => [
+          ...prev,
+          { who: body?.sender ?? "other", content: body?.content ?? "" },
+        ]);
+      },
+      onError: () => {},
+    });
+
+    chatClientRef.current = client;
+    client.activate();
+
+    return () => {
+      try {
+        client.deactivate();
+      } catch {}
+      chatClientRef.current = null;
+    };
+  }, [projectId]);
+
+  const handleSendChat = (text) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    setChatMessages((prev) => [...prev, { who: "me", content: trimmed }]);
+
+    try {
+      const c = chatClientRef.current;
+      if (c?.connected) {
+        sendChat(c, `p_${projectId}`, { content: trimmed });
+      }
+    } catch {}
+  };
+
+  // =========================
+  // Initial load
+  // =========================
+  useEffect(() => {
+    if (!projectId) {
+      pushTerminal(
+        "⚠️ 활성 프로젝트가 없습니다. /projects에서 프로젝트 선택 필요"
+      );
       return;
     }
+    fetchFileTree();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
 
-    // 연결
-    connectWsIfNeeded();
+  // =========================
+  // Tree click -> open file
+  // =========================
+  const handleClickNode = async (node) => {
+    setSelectedId(node.id);
 
-    const ws = wsRef.current;
-    const payload = { code: editorValue, language: lang, params: [] };
-
-    // 아직 open 전이면 pending에 넣고 onOpen에서 start
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      pendingStartRef.current = payload;
-      appendTerminal("[ws] connecting... (will start on open)");
-      return;
+    if (node.type === "FILE") {
+      if (dirty) {
+        const ok = confirm(
+          "저장되지 않은 변경이 있습니다. 저장하고 이동할까요?"
+        );
+        if (ok) await saveFileContent();
+      }
+      setOpenFileId(node.id);
+      await loadFileContent(node.id);
     }
+  };
 
-    try {
-      setRunning(true);
-      appendTerminal(`\n▶️ RUN (${lang})`);
-      wsStart(ws, payload);
-    } catch (e) {
-      console.error(e);
-      setRunning(false);
-      alert("실행 요청 실패 (Console 확인)");
-    }
-  }, [
-    running,
-    openFileId,
-    editorValue,
-    language,
-    connectWsIfNeeded,
-    appendTerminal,
-  ]);
-
-  const handleStop = useCallback(() => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    try {
-      wsStop(ws);
-      appendTerminal("⏹ stop sent");
-      setRunning(false);
-    } catch (e) {
-      console.error(e);
-    }
-  }, [appendTerminal]);
-
-  const handleTerminalInput = useCallback(
-    (text) => {
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      wsInput(ws, text);
-      appendTerminal("> " + text);
-    },
-    [appendTerminal]
-  );
-
-  // ---------- toggles/logout ----------
-  const onToggleLeft = useCallback(() => setShowLeft((v) => !v), []);
-  const onToggleRight = useCallback(() => setShowRight((v) => !v), []);
-  const onToggleTerminal = useCallback(() => setShowTerminal((v) => !v), []);
-
-  const handleLogout = useCallback(() => {
-    logout();
-    navigate("/login", { replace: true });
-  }, [navigate]);
-
-  // ---------- render ----------
-  if (!activeProject) return null;
+  // =========================
+  // Render helpers
+  // =========================
+  const explorerNodes = useMemo(() => tree ?? [], [tree]);
 
   return (
-    <div
-      className="ide-root"
-      style={{
-        height: "100vh",
-        display: "grid",
-        gridTemplateRows: "auto 1fr auto",
-      }}
-    >
-      <HeaderBar
-        onToggleLeft={onToggleLeft}
-        onToggleRight={onToggleRight}
-        onToggleTerminal={onToggleTerminal}
-        onLogout={handleLogout}
-        user={activeProject}
-        onRun={handleRun}
-        onStop={handleStop}
-        onSave={handleSave}
-        running={running}
-        language={language}
-        onChangeLanguage={setLanguage}
-      />
-
-      <div
-        className="ide-body"
-        style={{
-          display: "grid",
-          gridTemplateColumns: showLeft ? "280px 1fr 360px" : "1fr 360px",
-          minHeight: 0,
-        }}
-      >
-        {showLeft && (
-          <div
-            className="ide-left"
-            style={{
-              borderRight: "1px solid rgba(255,255,255,0.08)",
-              minWidth: 0,
-              overflow: "auto",
-            }}
+    <div className="ide-root">
+      {/* Header */}
+      <div className="header-root">
+        <div className="header-left">
+          <button className="icon-btn" onClick={() => setShowLeft((v) => !v)}>
+            Left
+          </button>
+          <button className="icon-btn" onClick={() => setShowRight((v) => !v)}>
+            Right
+          </button>
+          <button
+            className="icon-btn"
+            onClick={() => setShowTerminal((v) => !v)}
           >
-            <FileExplorer
-              tree={fileTree}
-              selectedPath={selectedPath}
-              onSelect={handleSelect}
-              onNewFile={handleNewFile}
-              onNewFolder={handleNewFolder}
-              onDelete={handleDelete}
-              disabled={!projectId}
-            />
-          </div>
-        )}
-
-        <div className="ide-center" style={{ minWidth: 0, minHeight: 0 }}>
-          <EditorArea
-            filename={
-              openFileName ||
-              (openFilePath ? openFilePath.split("/").pop() : "")
-            }
-            value={editorValue}
-            onChange={(v) => {
-              setEditorValue(v);
-              setDirty(true);
-            }}
-          />
-          {openFileId && (
-            <div
-              style={{
-                padding: "6px 12px",
-                fontSize: 12,
-                opacity: 0.7,
-                borderTop: "1px solid rgba(255,255,255,0.08)",
-              }}
-            >
-              {dirty ? "● Modified" : "Saved"} · fileId={openFileId}
-            </div>
-          )}
+            Terminal
+          </button>
         </div>
 
-        {showRight && (
-          <div
-            className="ide-right"
+        <div className="header-center">
+          <select
             style={{
-              borderLeft: "1px solid rgba(255,255,255,0.08)",
-              minWidth: 0,
-              minHeight: 0,
+              height: 34,
+              background: "#2d2d2d",
+              color: "#e5e5e5",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 6,
+              padding: "0 10px",
             }}
+            defaultValue="python"
           >
-            <ChatPanel projectId={projectId} />
+            <option value="python">python</option>
+            <option value="java">java</option>
+          </select>
+
+          <button
+            className="icon-btn"
+            onClick={() => pushTerminal("Run (demo)")}
+          >
+            Run
+          </button>
+          <button
+            className="icon-btn"
+            onClick={() => pushTerminal("Stop (demo)")}
+          >
+            Stop
+          </button>
+          <button
+            className="icon-btn"
+            onClick={saveFileContent}
+            disabled={!openFileId || saving}
+            title={!openFileId ? "파일을 선택하세요" : ""}
+          >
+            {saving ? "Saving..." : dirty ? "Save *" : "Save"}
+          </button>
+        </div>
+
+        <div className="header-right">
+          <div className="profile">
+            <div className="profile-avatar">👤</div>
+            <div className="profile-name">{project?.name ?? "프로젝트"}</div>
           </div>
-        )}
+        </div>
       </div>
 
-      {showTerminal && (
-        <div className="ide-bottom" style={{ height: 260, minHeight: 0 }}>
-          <TerminalPanel
-            lines={terminalLines}
-            onSendInput={handleTerminalInput}
-            onClear={clearTerminal}
-            disabled={false}
-          />
+      {/* Body */}
+      <div className="ide-body">
+        {/* Left - Explorer */}
+        <div className={`ide-left ${showLeft ? "" : "closed"}`}>
+          <div style={{ padding: 10, display: "grid", gap: 8 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button className="file-action-btn" onClick={handleNewFile}>
+                + New File
+              </button>
+              <button className="file-action-btn" onClick={handleNewFolder}>
+                + New Folder
+              </button>
+              <button
+                className="file-action-btn"
+                onClick={handleRename}
+                disabled={!selectedNode}
+                style={{ opacity: selectedNode ? 1 : 0.5 }}
+              >
+                ✏️ Rename
+              </button>
+              <button
+                className="file-action-btn"
+                onClick={handleDelete}
+                disabled={!selectedNode}
+                style={{ opacity: selectedNode ? 1 : 0.5 }}
+              >
+                🗑️ Delete
+              </button>
+            </div>
+
+            <div style={{ fontWeight: 800, letterSpacing: "0.08em" }}>
+              EXPLORER {treeLoading ? "(loading...)" : ""}
+            </div>
+
+            <div style={{ overflow: "auto", maxHeight: "calc(100vh - 160px)" }}>
+              <TreeView
+                nodes={explorerNodes}
+                selectedId={selectedId}
+                onClickNode={handleClickNode}
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Center - Editor */}
+        <div className="ide-center">
+          <div className="editor-root">
+            <div className="editor-tabs">
+              <button className={`editor-tab active`}>
+                {openFileNode?.name ?? "No file selected"}
+              </button>
+              {dirty && (
+                <span style={{ alignSelf: "center", opacity: 0.7 }}>
+                  (unsaved)
+                </span>
+              )}
+            </div>
+
+            <div className="editor-content">
+              {!openFileId ? (
+                <div style={{ opacity: 0.7, padding: 10 }}>
+                  파일을 선택해 코드를 입력해보세요...
+                </div>
+              ) : (
+                <textarea
+                  className="editor-textarea"
+                  value={editorText}
+                  onChange={(e) => {
+                    setEditorText(e.target.value);
+                    setDirty(true);
+                    // 데모 안정: 입력할 때마다 로컬 임시 저장
+                    localStorage.setItem(
+                      contentKey(projectId, openFileId),
+                      e.target.value
+                    );
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Right - Chat */}
+        <div className={`ide-right ${showRight ? "" : "closed"}`}>
+          <ChatPanel messages={chatMessages} onSend={handleSendChat} />
+        </div>
+      </div>
+
+      {/* Bottom - Terminal */}
+      <div className={`ide-bottom ${showTerminal ? "" : "closed"}`}>
+        <TerminalPanel
+          lines={terminalLines}
+          onClear={() => setTerminalLines(["Web IDE Terminal"])}
+          onSendInput={(text) => pushTerminal(`> ${text}`)}
+        />
+      </div>
+    </div>
+  );
+}
+
+// =========================
+// TreeView (simple)
+// =========================
+function TreeView({ nodes, selectedId, onClickNode }) {
+  return (
+    <div style={{ display: "grid", gap: 4 }}>
+      {nodes.map((n) => (
+        <TreeNode
+          key={n.id}
+          node={n}
+          depth={0}
+          selectedId={selectedId}
+          onClickNode={onClickNode}
+        />
+      ))}
+    </div>
+  );
+}
+
+function TreeNode({ node, depth, selectedId, onClickNode }) {
+  const isSelected = selectedId === node.id;
+  const isFolder = node.type === "FOLDER";
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => onClickNode(node)}
+        style={{
+          width: "100%",
+          textAlign: "left",
+          background: isSelected ? "rgba(59,130,246,0.18)" : "transparent",
+          border: "none",
+          color: "inherit",
+          padding: "6px 8px",
+          borderRadius: 6,
+          cursor: "pointer",
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          paddingLeft: 8 + depth * 14,
+        }}
+      >
+        <span style={{ opacity: 0.85 }}>{isFolder ? "📁" : "📄"}</span>
+        <span>{node.name}</span>
+      </button>
+
+      {isFolder && Array.isArray(node.children) && node.children.length > 0 && (
+        <div style={{ marginTop: 2 }}>
+          {node.children.map((c) => (
+            <TreeNode
+              key={c.id}
+              node={c}
+              depth={depth + 1}
+              selectedId={selectedId}
+              onClickNode={onClickNode}
+            />
+          ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// =========================
+// ChatPanel (simple)
+// =========================
+function ChatPanel({ messages, onSend }) {
+  const [text, setText] = useState("");
+  const listRef = useRef(null);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  return (
+    <div className="chat-root">
+      <div className="chat-header">TEAM CHATroom</div>
+
+      <div ref={listRef} className="chat-list">
+        {messages.map((m, idx) => {
+          const isMe = m.who === "me";
+          return (
+            <div
+              key={idx}
+              className={`chat-msg ${isMe ? "chat-msg--me" : "chat-msg--other"}`}
+            >
+              <div className="chat-meta">{m.who}</div>
+              <div className="chat-bubble">{m.content}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="chat-inputRow">
+        <textarea
+          className="chat-input"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="메시지를 입력하세요... (Enter 전송 / Shift+Enter 줄바꿈)"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              onSend?.(text);
+              setText("");
+            }
+          }}
+        />
+        <button
+          className="chat-sendBtn"
+          type="button"
+          onClick={() => {
+            onSend?.(text);
+            setText("");
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// =========================
+// TerminalPanel (simple)
+// =========================
+function TerminalPanel({ lines, onClear, onSendInput }) {
+  const [input, setInput] = useState("");
+
+  return (
+    <div className="terminal-root">
+      <div className="terminal-output">
+        {lines.map((l, i) => (
+          <div key={i} className="terminal-line">
+            {l}
+          </div>
+        ))}
+      </div>
+
+      <div className="terminal-inputRow">
+        <span className="terminal-prompt">&gt;</span>
+        <input
+          className="terminal-input"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="stdin 입력 후 Enter (필요할 때만)"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              onSendInput?.(input);
+              setInput("");
+            }
+          }}
+        />
+        <button className="file-action-btn" type="button" onClick={onClear}>
+          Clear
+        </button>
+      </div>
     </div>
   );
 }
