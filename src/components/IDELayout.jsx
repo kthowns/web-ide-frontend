@@ -64,6 +64,10 @@ function extToLang(filename) {
   if (name.endsWith(".java")) return "java";
   return null;
 }
+
+function normalizeType(type) {
+  return String(type || "").toUpperCase();
+}
 // ?쒕쾭 ?몃━ ?묐떟 normalize
 function normalizeTree(list) {
   if (!Array.isArray(list)) return [];
@@ -420,7 +424,7 @@ export default function IDELayout() {
   const handleClickNode = async (node) => {
     setSelectedId(node.id);
 
-    if (node.type === "FILE") {
+    if (normalizeType(node.type) === "FILE") {
       if (dirty) {
         const ok = confirm(
           "You have unsaved changes. Save before opening?"
@@ -534,12 +538,16 @@ export default function IDELayout() {
     };
   }, []);
 
-  const activeFileName = selectedNode?.type === "FILE"
-    ? selectedNode.name
+  const selectedNodeType = normalizeType(selectedNode?.type);
+  const openFileNodeType = normalizeType(openFileNode?.type);
+  const activeFileName = selectedNodeType === "FILE"
+    ? selectedNode?.name
     : openFileNode?.name || "";
   const activeLanguage = extToLang(activeFileName);
 
-  const isFileSelected = selectedNode?.type === "FILE" && !!openFileId;
+  const isFileSelected =
+    (selectedNodeType === "FILE" || openFileNodeType === "FILE") &&
+    !!openFileId;
   const isRunnableLanguage = !!activeLanguage;
   const isRunDisabled =
     !isFileSelected || !isRunnableLanguage || running || startPending;
@@ -549,7 +557,7 @@ export default function IDELayout() {
     let runDisabledReason = "";
   if (!isFileSelected) {
     runDisabledReason =
-      selectedNode?.type === "FOLDER"
+      selectedNodeType === "FOLDER"
         ? "Folders cannot be executed."
         : "Select a file.";
   } else if (!isRunnableLanguage) {
@@ -785,7 +793,7 @@ function TreeView({ nodes, selectedId, onClickNode }) {
 
 function TreeNode({ node, depth, selectedId, onClickNode }) {
   const isSelected = selectedId === node.id;
-  const isFolder = node.type === "FOLDER";
+  const isFolder = normalizeType(node.type) === "FOLDER";
 
   return (
     <div>
