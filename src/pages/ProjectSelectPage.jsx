@@ -1,46 +1,29 @@
+// src/pages/ProjectSelectPage.jsx
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { setActiveProject, getUserIdFromToken } from "../auth/auth";
 import { projectApi } from "../api/projectApi";
 
-const STORAGE_KEY = "webide:projects";
-
-// ✅ 서버 프로젝트 -> UI 프로젝트 형태로 변환
 function mapServerProject(p) {
   return {
-    id: String(p.id),
+    id: p.id, // ✅ 숫자 id 그대로
     name: p.name ?? `Project ${p.id}`,
     stack: p.description ?? "",
     updatedAt: p.updatedAt ? new Date(p.updatedAt).toLocaleString() : "",
-    members: "-", // 서버에 members count 필드 없음
     inviteCode: p.inviteCode,
     _raw: p,
   };
 }
 
-const loadProjectsLocal = () => {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-};
-
-const saveProjectsLocal = (projects) => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(projects));
-};
-
 export default function ProjectSelectPage() {
   const navigate = useNavigate();
 
-  const [projects, setProjects] = useState(() => loadProjectsLocal());
+  const [projects, setProjects] = useState([]);
   const [search, setSearch] = useState("");
-  const [selectedId, setSelectedId] = useState(
-    () => loadProjectsLocal()[0]?.id ?? null
-  );
+  const [selectedId, setSelectedId] = useState(null);
+
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   // Invite modal
   const [showInvite, setShowInvite] = useState(false);
@@ -48,47 +31,40 @@ export default function ProjectSelectPage() {
   const [inviteError, setInviteError] = useState("");
   const [inviteLoading, setInviteLoading] = useState(false);
 
-  // New project modal(간단 prompt 대신 inline로)
-  const [creating, setCreating] = useState(false);
+  const refreshMyProjects = async () => {
+    setLoading(true);
+    setLoadError("");
+    try {
+      const list = await projectApi.getMy(); // ✅ 서버에서만
+      const mapped = Array.isArray(list) ? list.map(mapServerProject) : [];
 
-  // ✅ 서버에서 프로젝트 목록 불러오기
-  const refreshProjects = async () => {
-    const list = await projectApi.getAll();
-    const mapped = Array.isArray(list) ? list.map(mapServerProject) : [];
-    setProjects(mapped);
-    saveProjectsLocal(mapped);
+      setProjects(mapped);
 
-    if (mapped.length > 0) {
       setSelectedId((prev) =>
-        mapped.some((p) => p.id === prev) ? prev : mapped[0].id
+        mapped.some((p) => p.id === prev) ? prev : (mapped[0]?.id ?? null)
       );
-    } else {
+    } catch (e) {
+      console.error(e);
+      setLoadError(
+        "프로젝트 목록을 불러오지 못했습니다. (로그인/토큰/서버 상태 확인)"
+      );
+      setProjects([]);
       setSelectedId(null);
+    } finally {
+      setLoading(false);
     }
   };
 
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        await refreshProjects();
-      } catch (e) {
-        console.warn("getAllProjects failed, fallback to local", e);
-        // 서버 실패 시 로컬 유지
-        if (!alive) return;
-      }
-    })();
-    return () => {
-      alive = false;
-    };
+    refreshMyProjects();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const filtered = useMemo(() => {
     const keyword = search.trim().toLowerCase();
     if (!keyword) return projects;
-    return projects.filter((project) =>
-      [project.name, project.stack].join(" ").toLowerCase().includes(keyword)
+    return projects.filter((p) =>
+      [p.name, p.stack].join(" ").toLowerCase().includes(keyword)
     );
   }, [projects, search]);
 
@@ -102,7 +78,7 @@ export default function ProjectSelectPage() {
     }
   }, [filtered, selectedId]);
 
-  const selectedProject = projects.find((p) => p.id === selectedId);
+  const selectedProject = projects.find((p) => p.id === selectedId) ?? null;
 
   const handleOpenProject = (project) => {
     if (!project) return;
@@ -110,32 +86,37 @@ export default function ProjectSelectPage() {
     navigate("/ide", { replace: true });
   };
 
-  // ✅ 서버 New Project
+  // ✅ 서버에 프로젝트 생성
   const handleNewProject = async () => {
     const name = prompt("새 프로젝트 이름을 입력하세요");
     if (name == null) return;
     const trimmed = name.trim();
     if (!trimmed) return;
 
-    const description = prompt("프로젝트 설명(선택)") ?? "";
-    setCreating(true);
-
     try {
-      await projectApi.create({
+      const created = await projectApi.create({
         name: trimmed,
-        description: description.trim(),
+        description: "",
       });
-      await refreshProjects();
-      alert("프로젝트 생성 완료!");
+
+      // 목록 새로고침 후 "방금 만든 것" 찾아서 열기 (더 안전)
+      await refreshMyProjects();
+
+      const createdId = created?.id;
+      const opened =
+        (createdId != null
+          ? projects.find((p) => String(p.id) === String(createdId))
+          : null) || mapServerProject(created);
+
+      setActiveProject(opened);
+      navigate("/ide", { replace: true });
     } catch (e) {
       console.error(e);
       alert("프로젝트 생성 실패 (Network/Console 확인)");
-    } finally {
-      setCreating(false);
     }
   };
 
-  // ✅ Invite: code -> getByInviteCode -> join -> refresh
+  // ✅ Swagger 기준: POST /api/projects/{projectId}/members/join?inviteCode=...&userId=...
   const handleJoinProject = async () => {
     const code = inviteCode.trim();
     if (!code) {
@@ -146,7 +127,7 @@ export default function ProjectSelectPage() {
     const userId = getUserIdFromToken();
     if (!userId) {
       setInviteError(
-        "토큰에서 userId를 찾을 수 없습니다. (JWT payload 확인 필요)"
+        "토큰에서 userId를 찾을 수 없습니다. (JWT payload에 userId/id/sub 중 하나가 있어야 합니다)"
       );
       return;
     }
@@ -155,6 +136,7 @@ export default function ProjectSelectPage() {
     setInviteError("");
 
     try {
+      // 1) 초대코드로 프로젝트 조회 (Swagger: /api/projects/invite/{inviteCode})
       const project = await projectApi.getByInviteCode(code);
       const projectId = project?.id;
 
@@ -163,13 +145,15 @@ export default function ProjectSelectPage() {
         return;
       }
 
+      // 2) 참가 (Swagger: /api/projects/{projectId}/members/join)
       await projectApi.joinByInviteCode({
         projectId,
         inviteCode: code,
         userId,
       });
 
-      await refreshProjects();
+      // 3) 내 프로젝트 목록 갱신
+      await refreshMyProjects();
 
       setInviteCode("");
       setShowInvite(false);
@@ -178,7 +162,7 @@ export default function ProjectSelectPage() {
       const msg =
         err?.response?.data?.message ||
         err?.response?.data?.error ||
-        err?.response?.data ||
+        (typeof err?.response?.data === "string" ? err.response.data : null) ||
         "초대코드 참가 실패 (서버 응답 확인)";
       setInviteError(typeof msg === "string" ? msg : JSON.stringify(msg));
     } finally {
@@ -194,14 +178,20 @@ export default function ProjectSelectPage() {
             <p className="project-select-kicker">Web IDE</p>
             <h1>Pick a project to open</h1>
             <p className="project-select-subtitle">
-              Double-click to open. Create or join via invite code.
+              Continue where you left off or spin up a fresh space.
             </p>
           </div>
+
           <div className="project-select-badge-group">
             <button
               type="button"
               className="project-select-badge project-select-badge--button"
-              onClick={() => setShowInvite((prev) => !prev)}
+              onClick={() => {
+                setInviteError("");
+                setInviteCode("");
+                setShowInvite((prev) => !prev);
+              }}
+              disabled={loading}
             >
               Invite
             </button>
@@ -221,41 +211,48 @@ export default function ProjectSelectPage() {
             type="button"
             className="project-select-btn project-select-btn--ghost"
             onClick={handleNewProject}
-            disabled={creating}
+            disabled={loading}
           >
-            {creating ? "Creating..." : "New Project"}
+            New Project
           </button>
         </div>
+
+        {loading && (
+          <div style={{ opacity: 0.8, padding: 10 }}>Loading projects...</div>
+        )}
+
+        {loadError && (
+          <div className="project-select-error" style={{ padding: 10 }}>
+            {loadError}
+          </div>
+        )}
 
         <div className="project-select-grid">
           {filtered.map((project) => {
             const isActive = project.id === selectedId;
             return (
               <button
-                key={project.id}
+                key={String(project.id)}
                 type="button"
                 className={`project-card ${isActive ? "is-active" : ""}`}
                 onClick={() => setSelectedId(project.id)}
                 onDoubleClick={() => handleOpenProject(project)}
+                disabled={loading}
               >
                 <div className="project-card-title">{project.name}</div>
                 <div className="project-card-stack">{project.stack}</div>
                 <div className="project-card-meta">
-                  <span>{project.members} members</span>
+                  <span>{project.inviteCode ? "invited" : "member"}</span>
                   <span>{project.updatedAt}</span>
                 </div>
-                {project.inviteCode ? (
-                  <div style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
-                    invite: {project.inviteCode}
-                  </div>
-                ) : null}
               </button>
             );
           })}
 
-          {filtered.length === 0 && (
+          {!loading && filtered.length === 0 && (
             <div className="project-card project-card--empty">
-              No matches. Try a different search.
+              서버 프로젝트가 없습니다. <br />
+              <b>New Project</b>로 생성하세요.
             </div>
           )}
         </div>
@@ -268,7 +265,7 @@ export default function ProjectSelectPage() {
             type="button"
             className="project-select-btn"
             onClick={() => handleOpenProject(selectedProject)}
-            disabled={!selectedProject}
+            disabled={!selectedProject || loading}
           >
             Open Project
           </button>
@@ -294,6 +291,7 @@ export default function ProjectSelectPage() {
                 type="button"
                 className="project-select-close"
                 onClick={() => setShowInvite(false)}
+                disabled={inviteLoading}
               >
                 Close
               </button>
@@ -305,6 +303,10 @@ export default function ProjectSelectPage() {
                 placeholder="e.g. DEV-2025"
                 value={inviteCode}
                 onChange={(e) => setInviteCode(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleJoinProject();
+                }}
+                disabled={inviteLoading}
               />
               <button
                 type="button"

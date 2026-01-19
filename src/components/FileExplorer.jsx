@@ -1,3 +1,4 @@
+// src/components/FileExplorer.jsx
 import { useMemo, useState } from "react";
 
 function normalizePath(path) {
@@ -93,7 +94,7 @@ function TreeNode({
           type="button"
           onClick={() => {
             toggle();
-            onSelect(curPath, "folder", node.id ?? null);
+            onSelect?.(curPath, "folder", node.id ?? null);
           }}
           style={{
             width: "100%",
@@ -105,6 +106,7 @@ function TreeNode({
             cursor: "pointer",
             fontWeight: 700,
             borderRadius: 6,
+            color: "inherit",
           }}
         >
           {isExpanded ? "📂" : "📁"} {node.name}
@@ -135,7 +137,7 @@ function TreeNode({
   return (
     <button
       type="button"
-      onClick={() => onSelect(curPath, "file", node.id ?? null)}
+      onClick={() => onSelect?.(curPath, "file", node.id ?? null)}
       style={{
         width: "100%",
         textAlign: "left",
@@ -146,6 +148,7 @@ function TreeNode({
         background: isActive ? "rgba(255,255,255,0.15)" : "transparent",
         cursor: "pointer",
         fontWeight: isActive ? 700 : 400,
+        color: "inherit",
       }}
     >
       📄 {node.name}
