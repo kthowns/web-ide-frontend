@@ -80,6 +80,31 @@ export default function ProjectSelectPage() {
 
   const selectedProject = projects.find((p) => p.id === selectedId) ?? null;
 
+  useEffect(() => {
+    let isMounted = true;
+    const loadInviteCode = async () => {
+      if (!selectedProject || selectedProject.inviteCode) return;
+      try {
+        const detail = await projectApi.getById(selectedProject.id);
+        if (!isMounted) return;
+        if (!detail?.inviteCode) return;
+        setProjects((prev) =>
+          prev.map((p) =>
+            p.id === selectedProject.id
+              ? { ...p, inviteCode: detail.inviteCode }
+              : p
+          )
+        );
+      } catch (e) {
+        console.error(e);
+      }
+    };
+    loadInviteCode();
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedProject]);
+
   const handleOpenProject = (project) => {
     if (!project) return;
     setActiveProject(project);

@@ -20,6 +20,12 @@ export const projectApi = {
     return data;
   },
 
+  // 프로젝트 상세 조회
+  getById: async (projectId) => {
+    const { data } = await client.get(`/api/projects/${projectId}`);
+    return data;
+  },
+
   // 초대코드로 프로젝트 조회
   getByInviteCode: async (inviteCode) => {
     const { data } = await client.get(`/api/projects/invite/${inviteCode}`);
